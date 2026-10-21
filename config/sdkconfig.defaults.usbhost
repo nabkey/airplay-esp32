@@ -1,0 +1,6 @@
+# USB host output: AirPlay audio plays through a USB sound card or DAC
+# plugged into the board's OTG port. Needs a chip with USB-OTG
+# (ESP32-S2/S3/P4). Layer on top of a board's defaults, e.g.
+#   idf.py -DSDKCONFIG_DEFAULTS="config/sdkconfig.defaults;config/sdkconfig.defaults.esp32s3;config/sdkconfig.defaults.usbhost" build
+
+CONFIG_AUDIO_OUTPUT_USB_HOST=y
