@@ -12,7 +12,15 @@
  * Unlike the UAC device backend this is a push model: the playback task
  * blocks in uac_host_device_write() once the driver's ring is full, exactly
  * as the I2S backend blocks on DMA space.  That keeps the ring at a steady
- * occupancy, which is what audio_output_get_hardware_latency_us() reports.
+ * occupancy.
+ *
+ * Queue depth is measured, not modelled.  The driver posts TX_DONE once its
+ * ring is at or below the threshold after it refills a finished isochronous
+ * transfer; opening with the threshold one byte under the ring size makes
+ * that every completion, which serves as the I2S backend's DMA-complete
+ * interrupt does.  Frames written minus frames the bus has finished sending
+ * is the depth of the ring plus the transfers in flight, interpolated
+ * between completions at the output rate.
  *
  * The pipeline is 16-bit throughout.  Cards that only take 24- or 32-bit
  * samples get the same audio widened on the way out: UAC 1.0 samples are
@@ -33,6 +41,7 @@
 #include "audio_resample.h"
 #include "led.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -81,6 +90,12 @@
 /* Longest a write may block before the task re-checks the card state. */
 #define WRITE_TIMEOUT_MS 50
 
+/* Isochronous transfers the driver keeps queued past its ring, each one
+ * packet per 1 ms full-speed frame. */
+#define URB_COUNT   CONFIG_UAC_NUM_ISOC_URBS
+#define URB_PACKETS CONFIG_UAC_NUM_PACKETS_PER_URB
+#define URB_US      (URB_PACKETS * 1000U)
+
 typedef enum {
   EVT_DRIVER_CONNECTED,
   EVT_DEVICE_DISCONNECTED,
@@ -107,12 +122,60 @@ static volatile bool resample_reinit_needed = false;
 static volatile uint32_t s_output_rate = PREFERRED_RATE;
 static volatile uint32_t s_underruns = 0;
 
+/* Queue-depth accounting, guarded by s_queue_lock: the playback task adds
+ * what it writes, the driver task what the bus has sent, and the timing
+ * engine reads both. */
+static portMUX_TYPE s_queue_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint64_t s_frames_written;
+static uint64_t s_frames_sent;
+static int64_t s_sent_us;        /* esp_timer at the last completion */
+static uint32_t s_urb_frac;      /* fractional frames, as the driver keeps */
+static uint32_t s_card_delay_us; /* the card's own bDelay */
+static TaskHandle_t s_play_task;
+
+static void queue_reset(uint32_t card_delay_us) {
+  portENTER_CRITICAL(&s_queue_lock);
+  s_frames_written = 0;
+  s_frames_sent = 0;
+  s_sent_us = 0;
+  s_urb_frac = 0;
+  s_card_delay_us = card_delay_us;
+  portEXIT_CRITICAL(&s_queue_lock);
+}
+
+/* Frames in one finished transfer.  At 44.1 kHz packets alternate between
+ * 44 and 45 frames; tracking the remainder the same way the driver does
+ * keeps the count within a frame of what it actually sent. */
+static uint32_t urb_frames(uint32_t rate) {
+  uint32_t frames = 0;
+  for (int i = 0; i < URB_PACKETS; i++) {
+    frames += rate / 1000;
+    s_urb_frac += rate % 1000;
+    if (s_urb_frac >= 1000) {
+      frames++;
+      s_urb_frac -= 1000;
+    }
+  }
+  return frames;
+}
+
 /* ── Driver callbacks (driver task context: post and return) ────────── */
 
 static void uac_device_cb(uac_host_device_handle_t handle,
                           const uac_host_device_event_t event, void *arg) {
   (void)arg;
-  if (event == UAC_HOST_DRIVER_EVENT_DISCONNECTED) {
+  if (event == UAC_HOST_DEVICE_EVENT_TX_DONE) {
+    /* uac_host_device_write() also posts this, from the playback task, when
+     * it restarts transfers that ran dry.  That is not a completion. */
+    if (xTaskGetCurrentTaskHandle() == s_play_task) {
+      return;
+    }
+    const int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_queue_lock);
+    s_frames_sent += urb_frames(s_output_rate);
+    s_sent_us = now;
+    portEXIT_CRITICAL(&s_queue_lock);
+  } else if (event == UAC_HOST_DRIVER_EVENT_DISCONNECTED) {
     usbh_evt_t evt = {.type = EVT_DEVICE_DISCONNECTED, .handle = handle};
     xQueueSend(s_evt_queue, &evt, 0);
   } else if (event == UAC_HOST_DEVICE_EVENT_TRANSFER_ERROR) {
@@ -209,11 +272,79 @@ static esp_err_t open_iface(uint8_t addr, uint8_t iface_num,
       .addr = addr,
       .iface_num = iface_num,
       .buffer_size = buffer_size,
-      .buffer_threshold = 0,
+      /* One byte short of full: TX_DONE on every transfer completion. */
+      .buffer_threshold = buffer_size - 1,
       .callback = uac_device_cb,
       .callback_arg = NULL,
   };
   return uac_host_device_open(&dev_cfg, handle);
+}
+
+/* What the class driver does not expose: the endpoint's synchronisation
+ * type and the card's bDelay, read from the configuration descriptor through
+ * a short-lived client of our own.  Both come from the first streaming
+ * alternate setting; cards do not vary them between settings. */
+typedef struct {
+  int sync_type; /* USB_BM_ATTRIBUTES_SYNC_* >> 2, or -1 if not found */
+  uint8_t delay_ms;
+} card_timing_t;
+
+static void client_event_cb(const usb_host_client_event_msg_t *msg, void *arg) {
+  (void)msg;
+  (void)arg;
+}
+
+static card_timing_t read_card_timing(uint8_t addr, uint8_t iface_num) {
+  card_timing_t timing = {.sync_type = -1, .delay_ms = 0};
+  const usb_host_client_config_t client_cfg = {
+      .is_synchronous = false,
+      .max_num_event_msg = 3,
+      .async = {.client_event_callback = client_event_cb, .callback_arg = NULL},
+  };
+  usb_host_client_handle_t client = NULL;
+  if (usb_host_client_register(&client_cfg, &client) != ESP_OK) {
+    return timing;
+  }
+  usb_device_handle_t dev = NULL;
+  const usb_config_desc_t *cfg = NULL;
+  if (usb_host_device_open(client, addr, &dev) == ESP_OK &&
+      usb_host_get_active_config_descriptor(dev, &cfg) == ESP_OK) {
+    const uint8_t *p = (const uint8_t *)cfg;
+    const size_t total = cfg->wTotalLength;
+    bool in_stream = false;
+    for (size_t off = 0; off + 2 <= total && p[off] >= 2; off += p[off]) {
+      const uint8_t len = p[off];
+      const uint8_t type = p[off + 1];
+      if (off + len > total) {
+        break;
+      }
+      if (type == USB_B_DESCRIPTOR_TYPE_INTERFACE && len >= 4) {
+        if (in_stream) {
+          break; /* first streaming alternate setting is enough */
+        }
+        in_stream = p[off + 2] == iface_num && p[off + 3] != 0;
+      } else if (in_stream && type == 0x24 && len >= 5 && p[off + 2] == 0x01) {
+        timing.delay_ms = p[off + 4]; /* CS AS_GENERAL: bDelay */
+      } else if (in_stream && type == USB_B_DESCRIPTOR_TYPE_ENDPOINT &&
+                 len >= 4 && (p[off + 2] & 0x80) == 0 &&
+                 (p[off + 3] & USB_BM_ATTRIBUTES_XFERTYPE_MASK) ==
+                     USB_BM_ATTRIBUTES_XFER_ISOC) {
+        timing.sync_type = (p[off + 3] & USB_BM_ATTRIBUTES_SYNCTYPE_MASK) >> 2;
+      }
+    }
+  }
+  if (dev) {
+    usb_host_device_close(client, dev);
+  }
+  /* Drain anything posted to us while open, then leave.  Bounded: the
+   * queue holds at most max_num_event_msg entries. */
+  for (int i = 0; i < client_cfg.max_num_event_msg + 1; i++) {
+    if (usb_host_client_handle_events(client, 0) != ESP_OK) {
+      break;
+    }
+  }
+  usb_host_client_deregister(client);
+  return timing;
 }
 
 static void open_card(uint8_t addr, uint8_t iface_num) {
@@ -241,6 +372,19 @@ static void open_card(uint8_t addr, uint8_t iface_num) {
   }
   ESP_LOGI(TAG, "Sound card %04x:%04x \"%ls\" connected", info.VID, info.PID,
            info.iProduct);
+
+  const card_timing_t timing = read_card_timing(addr, iface_num);
+  static const char *const sync_names[] = {"none", "asynchronous", "adaptive",
+                                           "synchronous"};
+  ESP_LOGI(TAG, "Endpoint sync: %s, card delay: %u ms",
+           timing.sync_type < 0 ? "unknown" : sync_names[timing.sync_type],
+           timing.delay_ms);
+  if (timing.sync_type == 1) {
+    /* The driver ignores the feedback endpoint, so packets are sized from
+     * our clock while the card's DAC runs on its own crystal. */
+    ESP_LOGW(TAG, "Asynchronous card: its clock is not slaved to ours, so "
+                  "expect slow drift and an occasional glitch");
+  }
 
   card_format_t fmt;
   if (!pick_format(handle, info.iface_alt_num, &fmt)) {
@@ -275,15 +419,17 @@ static void open_card(uint8_t addr, uint8_t iface_num) {
     return;
   }
 
-  xSemaphoreTake(s_dev_lock, portMAX_DELAY);
-  s_dev = handle;
-  s_dev_subframe = fmt.subframe;
-  xSemaphoreGive(s_dev_lock);
-
+  /* The rate must be in place before the first completion counts frames. */
   if (fmt.rate != s_output_rate) {
     s_output_rate = fmt.rate;
     resample_reinit_needed = true;
   }
+
+  xSemaphoreTake(s_dev_lock, portMAX_DELAY);
+  queue_reset((uint32_t)timing.delay_ms * 1000U);
+  s_dev = handle;
+  s_dev_subframe = fmt.subframe;
+  xSemaphoreGive(s_dev_lock);
   ESP_LOGI(TAG, "Streaming to card at %" PRIu32 " Hz, %u-bit in %u bytes",
            fmt.rate, fmt.bits, fmt.subframe);
 }
@@ -293,6 +439,7 @@ static void close_card(uac_host_device_handle_t handle) {
   if (handle == s_dev) {
     s_dev = NULL;
     s_dev_subframe = 0;
+    queue_reset(0);
   }
   xSemaphoreGive(s_dev_lock);
   uac_host_device_close(handle);
@@ -415,6 +562,9 @@ static bool write_card(int16_t *buf, size_t frames, uint8_t *wide_buf) {
                               pdMS_TO_TICKS(WRITE_TIMEOUT_MS));
     if (err == ESP_OK) {
       written = true;
+      portENTER_CRITICAL(&s_queue_lock);
+      s_frames_written += frames;
+      portEXIT_CRITICAL(&s_queue_lock);
     } else if (err == ESP_FAIL) {
       /* Ring stayed full for the whole timeout: the card stopped pulling. */
       s_underruns++;
@@ -426,6 +576,7 @@ static bool write_card(int16_t *buf, size_t frames, uint8_t *wide_buf) {
 
 static void playback_task(void *arg) {
   (void)arg;
+  s_play_task = xTaskGetCurrentTaskHandle();
   int16_t *pcm = malloc((size_t)(FRAME_SAMPLES + 1) * 2 * sizeof(int16_t));
   int16_t *silence = calloc((size_t)FRAME_SAMPLES * 2, sizeof(int16_t));
   int16_t *resample_buf = malloc(MAX_RESAMPLE_FRAMES * 2 * sizeof(int16_t));
@@ -524,16 +675,53 @@ void audio_output_set_source_rate(int rate) {
 }
 
 uint32_t audio_output_get_hardware_latency_us(void) {
-  // The playback task keeps the driver ring full, so a new write is heard
-  // after one ring's worth of audio.  The card's own buffering on top of
-  // that is not reported by UAC 1.0 and is not modelled here.
-  return DRIVER_RING_MS * 1000U;
+  // Fallback for when no depth can be measured: a full ring, plus the
+  // transfers in flight, which on average are half a transfer short of all
+  // queued.  The card's bDelay is added once it is known.
+  return DRIVER_RING_MS * 1000U + URB_COUNT * URB_US - URB_US / 2 +
+         s_card_delay_us;
+}
+
+bool audio_output_get_pipeline_us(int64_t *now_us, uint32_t *pipeline_us) {
+  portENTER_CRITICAL(&s_queue_lock);
+  const uint64_t written = s_frames_written;
+  const uint64_t sent = s_frames_sent;
+  const int64_t sent_us = s_sent_us;
+  const uint32_t card_delay_us = s_card_delay_us;
+  portEXIT_CRITICAL(&s_queue_lock);
+  const int64_t sampled_us = esp_timer_get_time();
+  const uint32_t rate = s_output_rate;
+
+  // Nothing has completed yet, or no card: let the caller use the model.
+  if (sent_us == 0 || rate == 0) {
+    return false;
+  }
+
+  uint64_t queued = written > sent ? written - sent : 0;
+  // Completions step the count a whole transfer at a time, so charge off
+  // what the bus has sent since the last one.  Past one transfer the next
+  // completion is already due; extrapolating further would invent drain.
+  if (sampled_us > sent_us) {
+    uint64_t drained = ((uint64_t)(sampled_us - sent_us) * rate) / 1000000ULL;
+    const uint64_t urb_max = (uint64_t)rate * URB_PACKETS / 1000U + 1U;
+    if (drained > urb_max) {
+      drained = urb_max;
+    }
+    queued = drained < queued ? queued - drained : 0U;
+  }
+
+  if (now_us) {
+    *now_us = sampled_us;
+  }
+  if (pipeline_us) {
+    *pipeline_us = (uint32_t)((queued * 1000000ULL) / rate) + card_delay_us;
+  }
+  return true;
 }
 
 uint32_t audio_output_get_underruns(void) {
   return s_underruns;
 }
 
-/* The UAC host driver exposes no transfer-completion cursor and there is no
- * channel routing, so the weak defaults in audio_output_common.c cover the
- * rest of the API. */
+/* There is no channel routing, so the weak defaults in audio_output_common.c
+ * cover the rest of the API. */

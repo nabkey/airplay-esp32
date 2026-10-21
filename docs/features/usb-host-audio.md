@@ -45,8 +45,13 @@ speaker mode, which needs the same port.
   background while no card is attached, so a card plugged in mid-song joins in sync.
 - AirPlay volume is applied in software, as on the S/PDIF output. The card's own volume is
   left where it was.
-- About 20 ms of audio is buffered in the USB driver, which is reported to the timing engine
-  so multiroom sync is kept.
+- About 30 ms of audio is queued in the USB driver. Its depth is measured from transfer
+  completions, the way the I2S output measures its DMA, so multiroom sync uses the real
+  figure rather than an estimate. The card's own delay is added when it reports one
+  (`bDelay`); delay inside the card that it does not report is not covered.
+- The boot log shows the card's endpoint sync type. **Adaptive** and **synchronous** cards
+  follow the board's clock. **Asynchronous** cards run on their own clock, and since the
+  driver does not use their feedback endpoint, expect slow drift and an occasional glitch.
 
 !!! note "No USB console"
 
