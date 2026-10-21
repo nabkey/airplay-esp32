@@ -34,9 +34,10 @@ speaker mode, which needs the same port.
   A card that offers none of these is logged with its full list of formats and left unused.
 - The card needs its own DAC chip. Passive USB-C to 3.5 mm adapters, which only pass analog
   audio from a phone, do not work.
-- **ESP32-S2 and S3**: the OTG port is full-speed only, so only **UAC 1.0** cards work. Most
-  inexpensive USB sound cards and dongles are UAC 1.0.
-- **ESP32-P4**: high-speed, so UAC 2.0 cards work as well.
+- **UAC 1.0 only, on every chip.** Espressif's USB host audio driver rejects UAC 2.0
+  devices, so even the high-speed ESP32-P4 cannot use them yet. Most inexpensive USB sound
+  cards and dongles are UAC 1.0, and many UAC 2.0 DACs fall back to UAC 1.0 when they are
+  connected at full speed (the S2 and S3 only run at full speed) or offer a UAC 1.0 mode.
 
 ## How it works
 
