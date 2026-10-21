@@ -59,6 +59,8 @@ if(CONFIG_AUDIO_OUTPUT_SPDIF)
     list(APPEND SRC_FILES "audio/audio_output_spdif.c")
 elseif(CONFIG_AUDIO_OUTPUT_USB)
     list(APPEND SRC_FILES "audio/audio_output_usb.c")
+elseif(CONFIG_AUDIO_OUTPUT_USB_HOST)
+    list(APPEND SRC_FILES "audio/audio_output_usb_host.c")
 else()
     list(APPEND SRC_FILES "audio/audio_output.c")
 endif()
@@ -136,6 +138,11 @@ set( DEPS
 #if(CONFIG_BT_A2DP_ENABLE)
     list(APPEND DEPS bt)
 #endif()
+
+# USB host stack for an external sound card
+if(CONFIG_AUDIO_OUTPUT_USB_HOST)
+    list(APPEND DEPS usb)
+endif()
 
 # Ethernet component only needed when W5500 is enabled
 #if(CONFIG_ETH_W5500_ENABLED)

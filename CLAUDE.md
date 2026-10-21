@@ -105,6 +105,7 @@ main/
 │   ├── audio_eq.c          # Software EQ (/bq page) for DACs without a DSP
 │   ├── audio_output_spdif.c # S/PDIF output
 │   ├── audio_output_usb.c  # USB audio *source* — board enumerates as a mic
+│   ├── audio_output_usb_host.c # USB host — plays into an external USB sound card
 │   ├── usb_audio_sink.c    # USB audio *sink* — board enumerates as a speaker
 │   ├── audio_crypto.c      # AirPlay encryption
 │   └── a2dp_sink.c         # Bluetooth A2DP sink
@@ -211,7 +212,7 @@ components/
 **Pre-commit hook**: auto-formats staged C/H files with clang-format, runs clang-tidy (requires `build/compile_commands.json`). Install via `git config core.hooksPath .githooks`.
 
 **CI** (`.github/workflows/`), five workflows:
-- `ci.yml` — on push to `main`, and on every PR to `main` or `staging`. A `changes` job skips the firmware jobs for a Markdown-only PR; `format-check` (clang-format), `lint-check` (clang-tidy against an esp32s3 build), `output-backends` (links the spdif and usb backends, which the release matrix never covers) and `build` follow. **`ci-gate` is the one required check** — it runs unconditionally and treats skipped as fine, so branch protection does not have to list every matrix job.
+- `ci.yml` — on push to `main`, and on every PR to `main` or `staging`. A `changes` job skips the firmware jobs for a Markdown-only PR; `format-check` (clang-format), `lint-check` (clang-tidy against an esp32s3 build), `output-backends` (links the spdif, usb and usbhost backends, which the release matrix never covers) and `build` follow. **`ci-gate` is the one required check** — it runs unconditionally and treats skipped as fine, so branch protection does not have to list every matrix job.
 - `build.yml` — reusable, and the entry point for the release matrix. The matrix itself is `.github/workflows/targets.json`, because a matrix has to be JSON before `fromJSON` can filter it. Every entry there gets a published `airplay2-receiver-<name>.bin` and needs a matching `docs/firmware/<name>.json`. Entries flagged `"core": true` are the subset a **pull request** builds — one per chip and per `components/boards/` directory; a push to `main`, a push to `staging` and a tag build the lot. `fail-fast: false`, so a broken board no longer cancels the rest. Targets: esp32s3, waveshare-esp32s3, esp32s2, squeezeamp-bt, squeezeamp-4m, smartamp, the esparagus ones (audio-brick-bt, -s3, -dual-dac, -dual-uac, louder-bt, louder-s3, echo) and the Sonocotta dock boards (hifi-, loud-, amped-, louder- variants). **An ESP32 board's published binary is always the Bluetooth one** — the non-BT envs still exist, they just are not released.
 - `release.yml` — on a `v*` tag. Refuses to release unless the tag matches `version.txt` and points at a commit on `main`, then publishes the merged binaries.
 - `beta.yml` — on push to `staging`. Same matrix, published to a rolling `beta` pre-release that is deleted and recreated each time so the tag follows the staging tip. Because the matrix does not fail fast, `publish` runs on `always()` and ships whatever built, warning about each missing target; it only errors when nothing built at all. Fails if `version.txt` on staging is not strictly greater than the latest release, so **bump `version.txt` on staging right after a release**.
