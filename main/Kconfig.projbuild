@@ -190,8 +190,9 @@ menu "Airplay ESP Configuration"
                 enumerates as a device on a computer.
 
                 The card must be UAC 1.0 and offer 16, 24 or 32-bit
-                stereo PCM at 48 kHz or 44.1 kHz. AirPlay audio is
-                resampled to the card's rate when needed. UAC 2.0 cards
+                stereo PCM at 48 kHz or 44.1 kHz. It runs at the source's
+                own rate when it offers it, so AirPlay plays at 44.1 kHz
+                without resampling; other rates are resampled. UAC 2.0 cards
                 are not supported on any chip: the usb_host_uac driver
                 only accepts UAC 1.0.
 

@@ -29,9 +29,13 @@ speaker mode, which needs the same port.
 
 ## Supported cards
 
-- **Stereo PCM at 16, 24 or 32 bits**, at 48 kHz or 44.1 kHz as a fallback. The narrowest
-  depth the card offers is used; wider ones carry the same 16-bit audio padded with zeros.
-  A card that offers none of these is logged with its full list of formats and left unused.
+- **Stereo PCM at 16, 24 or 32 bits.** The narrowest depth the card offers is used; wider
+  ones carry the same 16-bit audio padded with zeros.
+- **The card runs at the source's own rate when it can:** 44.1 kHz for AirPlay, and usually
+  48 kHz for Sendspin, so neither is resampled. When the source changes rate the stream
+  restarts at the new one, which costs a moment of silence. A rate the card does not offer
+  is resampled to 48 kHz, or 44.1 kHz if the card lacks 48 kHz too. A card that offers
+  neither is logged with its full list of formats and left unused.
 - The card needs its own DAC chip. Passive USB-C to 3.5 mm adapters, which only pass analog
   audio from a phone, do not work.
 - **UAC 1.0 only, on every chip.** Espressif's USB host audio driver rejects UAC 2.0
