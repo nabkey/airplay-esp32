@@ -22,6 +22,13 @@
  * is the depth of the ring plus the transfers in flight, interpolated
  * between completions at the output rate.
  *
+ * The card follows the source's sample rate.  AirPlay arrives at 44.1 kHz
+ * and Sendspin usually at 48 kHz; when the source changes rate the stream is
+ * restarted at the new one if the card offers it, so neither is resampled.
+ * Only a rate the card lacks goes through the resampler, to 48 kHz or
+ * failing that 44.1 kHz.  The restart costs a few tens of milliseconds of
+ * silence, and only when the rate actually changes.
+ *
  * The pipeline is 16-bit throughout.  Cards that only take 24- or 32-bit
  * samples get the same audio widened on the way out: UAC 1.0 samples are
  * MSB-justified in their subframe, so the 16-bit sample goes in the top two
@@ -56,8 +63,8 @@
 #define TAG           "audio_usbh"
 #define FRAME_SAMPLES 352
 
-/* Preferred card rate; 44.1 kHz is accepted as a fallback, in which case
- * AirPlay plays without resampling. */
+/* Card rates to resample to when the card does not offer the source's
+ * own, in order of preference. */
 #define PREFERRED_RATE CONFIG_OUTPUT_SAMPLE_RATE_HZ
 #define FALLBACK_RATE  44100
 
@@ -99,6 +106,7 @@
 typedef enum {
   EVT_DRIVER_CONNECTED,
   EVT_DEVICE_DISCONNECTED,
+  EVT_SOURCE_RATE, /* the source changed rate; the card may follow */
 } usbh_evt_type_t;
 
 typedef struct {
@@ -240,25 +248,52 @@ typedef struct {
   uint8_t subframe;
 } card_format_t;
 
-/* Pick the card's format: the preferred rate before the fallback, and at
- * each rate the narrowest depth, since anything wider only pads zeros. */
-static bool pick_format(uac_host_device_handle_t handle, uint8_t alt_count,
-                        card_format_t *fmt) {
-  const uint32_t rates[] = {PREFERRED_RATE, FALLBACK_RATE};
+/* The card's format at one rate: the narrowest depth it offers there, since
+ * anything wider only pads zeros. */
+static bool pick_depth(uac_host_device_handle_t handle, uint8_t alt_count,
+                       uint32_t rate, card_format_t *fmt) {
   const uint8_t depths[] = {16, 24, 32};
-  for (size_t r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
-    for (size_t d = 0; d < sizeof(depths) / sizeof(depths[0]); d++) {
-      uac_host_dev_alt_param_t param;
-      if (!find_alt(handle, alt_count, depths[d], rates[r], &param)) {
-        continue;
-      }
-      if (param.subframe_size * 8 < depths[d] || param.subframe_size < 2 ||
-          param.subframe_size > MAX_SUBFRAME) {
-        continue;
-      }
-      fmt->rate = rates[r];
-      fmt->bits = depths[d];
-      fmt->subframe = param.subframe_size;
+  for (size_t d = 0; d < sizeof(depths) / sizeof(depths[0]); d++) {
+    uac_host_dev_alt_param_t param;
+    if (!find_alt(handle, alt_count, depths[d], rate, &param)) {
+      continue;
+    }
+    if (param.subframe_size * 8 < depths[d] || param.subframe_size < 2 ||
+        param.subframe_size > MAX_SUBFRAME) {
+      continue;
+    }
+    fmt->rate = rate;
+    fmt->bits = depths[d];
+    fmt->subframe = param.subframe_size;
+    return true;
+  }
+  return false;
+}
+
+/* Rates to try for a source at `want`: its own first, then the resampling
+ * targets.  Returns how many were written, duplicates dropped. */
+static size_t rate_candidates(uint32_t want, uint32_t out[3]) {
+  const uint32_t all[] = {want, PREFERRED_RATE, FALLBACK_RATE};
+  size_t n = 0;
+  for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
+    bool dup = false;
+    for (size_t j = 0; j < n; j++) {
+      dup |= out[j] == all[i];
+    }
+    if (!dup && all[i] > 0) {
+      out[n++] = all[i];
+    }
+  }
+  return n;
+}
+
+/* The format start_card() would choose for a source at `want`. */
+static bool choose_format(uac_host_device_handle_t handle, uint8_t alt_count,
+                          uint32_t want, card_format_t *fmt) {
+  uint32_t rates[3];
+  const size_t n = rate_candidates(want, rates);
+  for (size_t i = 0; i < n; i++) {
+    if (pick_depth(handle, alt_count, rates[i], fmt)) {
       return true;
     }
   }
@@ -347,20 +382,24 @@ static card_timing_t read_card_timing(uint8_t addr, uint8_t iface_num) {
   return timing;
 }
 
-static void open_card(uint8_t addr, uint8_t iface_num) {
-  if (s_dev) {
-    ESP_LOGW(TAG, "Ignoring second sound card (addr %u)", addr);
-    return;
-  }
+/* The attached card, owned by the control task.  s_dev is its open stream
+ * and is NULL while the stream is being restarted. */
+static bool s_card_present;
+static uint8_t s_card_addr;
+static uint8_t s_card_iface;
+static uint32_t s_card_delay;
+static card_format_t s_card_fmt;
 
-  /* The ring is sized at open, before the format is known: guess 16-bit at
-   * the preferred rate and reopen below if the card needs otherwise. */
-  uint32_t ring_bytes = DRIVER_RING_BYTES(PREFERRED_RATE, 2);
+/* Open the card's playback interface and start it at the best format for a
+ * source at `want`, trying the next candidate rate if a start fails.  The
+ * ring is sized at open, so a format that needs another size reopens. */
+static bool start_card(uint32_t want, bool announce) {
+  uint32_t ring_bytes = DRIVER_RING_BYTES(want, 2);
   uac_host_device_handle_t handle = NULL;
-  esp_err_t err = open_iface(addr, iface_num, ring_bytes, &handle);
+  esp_err_t err = open_iface(s_card_addr, s_card_iface, ring_bytes, &handle);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Open failed: %s", esp_err_to_name(err));
-    return;
+    return false;
   }
 
   uac_host_dev_info_t info;
@@ -368,10 +407,91 @@ static void open_card(uint8_t addr, uint8_t iface_num) {
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Device info failed: %s", esp_err_to_name(err));
     uac_host_device_close(handle);
+    return false;
+  }
+  if (announce) {
+    ESP_LOGI(TAG, "Sound card %04x:%04x \"%ls\" connected", info.VID, info.PID,
+             info.iProduct);
+  }
+
+  uint32_t rates[3];
+  const size_t n = rate_candidates(want, rates);
+  for (size_t i = 0; i < n; i++) {
+    card_format_t fmt;
+    if (!pick_depth(handle, info.iface_alt_num, rates[i], &fmt)) {
+      continue;
+    }
+    if (DRIVER_RING_BYTES(fmt.rate, fmt.subframe) != ring_bytes) {
+      ring_bytes = DRIVER_RING_BYTES(fmt.rate, fmt.subframe);
+      uac_host_device_close(handle);
+      handle = NULL;
+      err = open_iface(s_card_addr, s_card_iface, ring_bytes, &handle);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Reopen failed: %s", esp_err_to_name(err));
+        return false;
+      }
+    }
+
+    const uac_host_stream_config_t stream_cfg = {
+        .channels = CHANNELS,
+        .bit_resolution = fmt.bits,
+        .sample_freq = fmt.rate,
+        .flags = 0,
+    };
+    err = uac_host_device_start(handle, &stream_cfg);
+    if (err != ESP_OK) {
+      ESP_LOGW(TAG, "Start at %" PRIu32 " Hz failed: %s", fmt.rate,
+               esp_err_to_name(err));
+      continue;
+    }
+
+    /* The rate must be in place before the first completion counts
+     * frames. */
+    if (fmt.rate != s_output_rate) {
+      s_output_rate = fmt.rate;
+      resample_reinit_needed = true;
+    }
+    s_card_fmt = fmt;
+
+    xSemaphoreTake(s_dev_lock, portMAX_DELAY);
+    queue_reset(s_card_delay);
+    s_dev = handle;
+    s_dev_subframe = fmt.subframe;
+    xSemaphoreGive(s_dev_lock);
+    ESP_LOGI(TAG, "Streaming to card at %" PRIu32 " Hz, %u-bit in %u bytes%s",
+             fmt.rate, fmt.bits, fmt.subframe,
+             fmt.rate == want ? "" : " (resampling)");
+    return true;
+  }
+
+  ESP_LOGE(TAG,
+           "Card offers no usable 16/24/32-bit stereo stream at %" PRIu32
+           ", %d or %d Hz",
+           want, PREFERRED_RATE, FALLBACK_RATE);
+  uac_host_printf_device_param(handle);
+  uac_host_device_close(handle);
+  return false;
+}
+
+/* Detach the open stream from the playback task and close it.  The caller
+ * decides whether the card itself is gone. */
+static void stop_card(void) {
+  xSemaphoreTake(s_dev_lock, portMAX_DELAY);
+  uac_host_device_handle_t handle = s_dev;
+  s_dev = NULL;
+  s_dev_subframe = 0;
+  queue_reset(0);
+  xSemaphoreGive(s_dev_lock);
+  if (handle) {
+    uac_host_device_close(handle);
+  }
+}
+
+static void open_card(uint8_t addr, uint8_t iface_num) {
+  if (s_card_present) {
+    ESP_LOGW(TAG, "Ignoring second sound card (addr %u)", addr);
     return;
   }
-  ESP_LOGI(TAG, "Sound card %04x:%04x \"%ls\" connected", info.VID, info.PID,
-           info.iProduct);
 
   const card_timing_t timing = read_card_timing(addr, iface_num);
   static const char *const sync_names[] = {"none", "asynchronous", "adaptive",
@@ -386,63 +506,39 @@ static void open_card(uint8_t addr, uint8_t iface_num) {
                   "expect slow drift and an occasional glitch");
   }
 
+  s_card_addr = addr;
+  s_card_iface = iface_num;
+  s_card_delay = (uint32_t)timing.delay_ms * 1000U;
+  s_card_present = start_card((uint32_t)source_rate, true);
+}
+
+/* The source changed rate: restart the card at it if that changes the
+ * format the card would run, and leave it alone otherwise. */
+static void follow_source_rate(void) {
+  if (!s_card_present || !s_dev) {
+    return;
+  }
+  const uint32_t want = (uint32_t)source_rate;
+  uac_host_dev_info_t info;
   card_format_t fmt;
-  if (!pick_format(handle, info.iface_alt_num, &fmt)) {
-    ESP_LOGE(TAG, "Card offers no 16/24/32-bit stereo stream at %d or %d Hz",
-             PREFERRED_RATE, FALLBACK_RATE);
-    uac_host_printf_device_param(handle);
-    uac_host_device_close(handle);
+  if (uac_host_get_device_info(s_dev, &info) != ESP_OK ||
+      !choose_format(s_dev, info.iface_alt_num, want, &fmt) ||
+      (fmt.rate == s_card_fmt.rate && fmt.bits == s_card_fmt.bits)) {
     return;
   }
-
-  if (DRIVER_RING_BYTES(fmt.rate, fmt.subframe) != ring_bytes) {
-    ring_bytes = DRIVER_RING_BYTES(fmt.rate, fmt.subframe);
-    uac_host_device_close(handle);
-    handle = NULL;
-    err = open_iface(addr, iface_num, ring_bytes, &handle);
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Reopen failed: %s", esp_err_to_name(err));
-      return;
-    }
-  }
-
-  const uac_host_stream_config_t stream_cfg = {
-      .channels = CHANNELS,
-      .bit_resolution = fmt.bits,
-      .sample_freq = fmt.rate,
-      .flags = 0,
-  };
-  err = uac_host_device_start(handle, &stream_cfg);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Stream start failed: %s", esp_err_to_name(err));
-    uac_host_device_close(handle);
-    return;
-  }
-
-  /* The rate must be in place before the first completion counts frames. */
-  if (fmt.rate != s_output_rate) {
-    s_output_rate = fmt.rate;
-    resample_reinit_needed = true;
-  }
-
-  xSemaphoreTake(s_dev_lock, portMAX_DELAY);
-  queue_reset((uint32_t)timing.delay_ms * 1000U);
-  s_dev = handle;
-  s_dev_subframe = fmt.subframe;
-  xSemaphoreGive(s_dev_lock);
-  ESP_LOGI(TAG, "Streaming to card at %" PRIu32 " Hz, %u-bit in %u bytes",
-           fmt.rate, fmt.bits, fmt.subframe);
+  ESP_LOGI(TAG, "Source now %" PRIu32 " Hz, restarting card", want);
+  stop_card();
+  s_card_present = start_card(want, false);
 }
 
 static void close_card(uac_host_device_handle_t handle) {
-  xSemaphoreTake(s_dev_lock, portMAX_DELAY);
-  if (handle == s_dev) {
-    s_dev = NULL;
-    s_dev_subframe = 0;
-    queue_reset(0);
+  /* Only the open stream is ours to close.  Any other handle is one this
+   * task already closed, during a restart or after rejecting the card. */
+  if (handle != s_dev) {
+    return;
   }
-  xSemaphoreGive(s_dev_lock);
-  uac_host_device_close(handle);
+  stop_card();
+  s_card_present = false;
   ESP_LOGI(TAG, "Sound card disconnected");
 }
 
@@ -499,6 +595,9 @@ static void usb_ctl_task(void *arg) {
       break;
     case EVT_DEVICE_DISCONNECTED:
       close_card(evt.handle);
+      break;
+    case EVT_SOURCE_RATE:
+      follow_source_rate();
       break;
     }
   }
@@ -671,6 +770,12 @@ void audio_output_set_source_rate(int rate) {
   if (rate > 0 && rate != source_rate) {
     source_rate = rate;
     resample_reinit_needed = true;
+    if (s_evt_queue) {
+      /* The control task reads source_rate itself, so a lost event only
+       * delays following until the next change. */
+      usbh_evt_t evt = {.type = EVT_SOURCE_RATE};
+      xQueueSend(s_evt_queue, &evt, 0);
+    }
   }
 }
 
