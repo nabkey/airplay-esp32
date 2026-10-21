@@ -14,6 +14,11 @@
  * as the I2S backend blocks on DMA space.  That keeps the ring at a steady
  * occupancy, which is what audio_output_get_hardware_latency_us() reports.
  *
+ * The pipeline is 16-bit throughout.  Cards that only take 24- or 32-bit
+ * samples get the same audio widened on the way out: UAC 1.0 samples are
+ * MSB-justified in their subframe, so the 16-bit sample goes in the top two
+ * bytes and the rest are zero.
+ *
  * Cards come and go at runtime.  The driver's callbacks only post events to
  * a queue; opening, starting and closing a card happens on the control task,
  * because the driver does not allow those calls from its own callback.  While
@@ -63,14 +68,15 @@
 #define USB_CTL_TASK_PRIORITY 5
 #define USB_TASK_CORE         0
 
-#define BYTES_PER_FRAME 4 /* stereo 16-bit */
+#define CHANNELS     2
+#define MAX_SUBFRAME 4 /* bytes per sample on the wire, 32-bit worst case */
 
 /* Driver-side ring.  The playback task keeps it full, so its size is the
  * steady-state output latency: ~20 ms is deep enough to ride out a source
  * burst and shallow enough not to matter to the timing engine. */
 #define DRIVER_RING_MS 20
-#define DRIVER_RING_BYTES(rate) \
-  ((uint32_t)(rate) * DRIVER_RING_MS / 1000 * BYTES_PER_FRAME)
+#define DRIVER_RING_BYTES(rate, subframe) \
+  ((uint32_t)(rate) * DRIVER_RING_MS / 1000 * CHANNELS * (subframe))
 
 /* Longest a write may block before the task re-checks the card state. */
 #define WRITE_TIMEOUT_MS 50
@@ -93,7 +99,7 @@ static QueueHandle_t s_evt_queue;
  * open/close, so a card is never closed under an in-flight write. */
 static SemaphoreHandle_t s_dev_lock;
 static uac_host_device_handle_t s_dev;
-static uint32_t s_dev_rate;
+static uint8_t s_dev_subframe;
 
 static volatile bool flush_requested = false;
 static volatile int source_rate = 44100;
@@ -141,23 +147,73 @@ static bool alt_supports_rate(const uac_host_dev_alt_param_t *alt,
   return false;
 }
 
-/* Pick the card's rate: the preferred rate if any 16-bit stereo alternate
- * setting offers it, else the fallback.  Returns 0 if neither is offered. */
-static uint32_t pick_rate(uac_host_device_handle_t handle, uint8_t alt_count) {
-  const uint32_t rates[] = {PREFERRED_RATE, FALLBACK_RATE};
-  for (size_t r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
-    for (uint8_t alt = 1; alt <= alt_count; alt++) {
-      uac_host_dev_alt_param_t param;
-      if (uac_host_get_device_alt_param(handle, alt, &param) != ESP_OK) {
-        continue;
-      }
-      if (param.channels == 2 && param.bit_resolution == 16 &&
-          alt_supports_rate(&param, rates[r])) {
-        return rates[r];
-      }
+/* The alternate setting uac_host_device_start() will claim for this format,
+ * found the same way it does: later discrete-rate matches replace earlier
+ * ones and a matching range ends the search.  Its subframe size decides the
+ * byte layout, so it has to be the one the driver picks. */
+static bool find_alt(uac_host_device_handle_t handle, uint8_t alt_count,
+                     uint8_t bits, uint32_t rate,
+                     uac_host_dev_alt_param_t *out) {
+  bool found = false;
+  for (uint8_t alt = 1; alt <= alt_count; alt++) {
+    uac_host_dev_alt_param_t param;
+    if (uac_host_get_device_alt_param(handle, alt, &param) != ESP_OK ||
+        param.channels != CHANNELS || param.bit_resolution != bits ||
+        !alt_supports_rate(&param, rate)) {
+      continue;
+    }
+    *out = param;
+    found = true;
+    if (param.sample_freq_type == 0) {
+      break;
     }
   }
-  return 0;
+  return found;
+}
+
+typedef struct {
+  uint32_t rate;
+  uint8_t bits;
+  uint8_t subframe;
+} card_format_t;
+
+/* Pick the card's format: the preferred rate before the fallback, and at
+ * each rate the narrowest depth, since anything wider only pads zeros. */
+static bool pick_format(uac_host_device_handle_t handle, uint8_t alt_count,
+                        card_format_t *fmt) {
+  const uint32_t rates[] = {PREFERRED_RATE, FALLBACK_RATE};
+  const uint8_t depths[] = {16, 24, 32};
+  for (size_t r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
+    for (size_t d = 0; d < sizeof(depths) / sizeof(depths[0]); d++) {
+      uac_host_dev_alt_param_t param;
+      if (!find_alt(handle, alt_count, depths[d], rates[r], &param)) {
+        continue;
+      }
+      if (param.subframe_size * 8 < depths[d] || param.subframe_size < 2 ||
+          param.subframe_size > MAX_SUBFRAME) {
+        continue;
+      }
+      fmt->rate = rates[r];
+      fmt->bits = depths[d];
+      fmt->subframe = param.subframe_size;
+      return true;
+    }
+  }
+  return false;
+}
+
+static esp_err_t open_iface(uint8_t addr, uint8_t iface_num,
+                            uint32_t buffer_size,
+                            uac_host_device_handle_t *handle) {
+  const uac_host_device_config_t dev_cfg = {
+      .addr = addr,
+      .iface_num = iface_num,
+      .buffer_size = buffer_size,
+      .buffer_threshold = 0,
+      .callback = uac_device_cb,
+      .callback_arg = NULL,
+  };
+  return uac_host_device_open(&dev_cfg, handle);
 }
 
 static void open_card(uint8_t addr, uint8_t iface_num) {
@@ -166,16 +222,11 @@ static void open_card(uint8_t addr, uint8_t iface_num) {
     return;
   }
 
+  /* The ring is sized at open, before the format is known: guess 16-bit at
+   * the preferred rate and reopen below if the card needs otherwise. */
+  uint32_t ring_bytes = DRIVER_RING_BYTES(PREFERRED_RATE, 2);
   uac_host_device_handle_t handle = NULL;
-  const uac_host_device_config_t dev_cfg = {
-      .addr = addr,
-      .iface_num = iface_num,
-      .buffer_size = DRIVER_RING_BYTES(PREFERRED_RATE),
-      .buffer_threshold = 0,
-      .callback = uac_device_cb,
-      .callback_arg = NULL,
-  };
-  esp_err_t err = uac_host_device_open(&dev_cfg, &handle);
+  esp_err_t err = open_iface(addr, iface_num, ring_bytes, &handle);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Open failed: %s", esp_err_to_name(err));
     return;
@@ -191,19 +242,30 @@ static void open_card(uint8_t addr, uint8_t iface_num) {
   ESP_LOGI(TAG, "Sound card %04x:%04x \"%ls\" connected", info.VID, info.PID,
            info.iProduct);
 
-  uint32_t rate = pick_rate(handle, info.iface_alt_num);
-  if (rate == 0) {
-    ESP_LOGE(TAG, "Card offers no 16-bit stereo stream at %d or %d Hz",
+  card_format_t fmt;
+  if (!pick_format(handle, info.iface_alt_num, &fmt)) {
+    ESP_LOGE(TAG, "Card offers no 16/24/32-bit stereo stream at %d or %d Hz",
              PREFERRED_RATE, FALLBACK_RATE);
     uac_host_printf_device_param(handle);
     uac_host_device_close(handle);
     return;
   }
 
+  if (DRIVER_RING_BYTES(fmt.rate, fmt.subframe) != ring_bytes) {
+    ring_bytes = DRIVER_RING_BYTES(fmt.rate, fmt.subframe);
+    uac_host_device_close(handle);
+    handle = NULL;
+    err = open_iface(addr, iface_num, ring_bytes, &handle);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Reopen failed: %s", esp_err_to_name(err));
+      return;
+    }
+  }
+
   const uac_host_stream_config_t stream_cfg = {
-      .channels = 2,
-      .bit_resolution = 16,
-      .sample_freq = rate,
+      .channels = CHANNELS,
+      .bit_resolution = fmt.bits,
+      .sample_freq = fmt.rate,
       .flags = 0,
   };
   err = uac_host_device_start(handle, &stream_cfg);
@@ -215,21 +277,22 @@ static void open_card(uint8_t addr, uint8_t iface_num) {
 
   xSemaphoreTake(s_dev_lock, portMAX_DELAY);
   s_dev = handle;
-  s_dev_rate = rate;
+  s_dev_subframe = fmt.subframe;
   xSemaphoreGive(s_dev_lock);
 
-  if (rate != s_output_rate) {
-    s_output_rate = rate;
+  if (fmt.rate != s_output_rate) {
+    s_output_rate = fmt.rate;
     resample_reinit_needed = true;
   }
-  ESP_LOGI(TAG, "Streaming to card at %" PRIu32 " Hz", rate);
+  ESP_LOGI(TAG, "Streaming to card at %" PRIu32 " Hz, %u-bit in %u bytes",
+           fmt.rate, fmt.bits, fmt.subframe);
 }
 
 static void close_card(uac_host_device_handle_t handle) {
   xSemaphoreTake(s_dev_lock, portMAX_DELAY);
   if (handle == s_dev) {
     s_dev = NULL;
-    s_dev_rate = 0;
+    s_dev_subframe = 0;
   }
   xSemaphoreGive(s_dev_lock);
   uac_host_device_close(handle);
@@ -321,15 +384,35 @@ static void apply_volume(int16_t *buf, size_t n) {
 
 /* ── Playback task ─────────────────────────────────────────────────── */
 
+/* Widen interleaved 16-bit samples into subframes of `subframe` bytes:
+ * little-endian, MSB-justified, low bytes zero. */
+static void widen(const int16_t *in, size_t samples, uint8_t subframe,
+                  uint8_t *out) {
+  for (size_t i = 0; i < samples; i++) {
+    uint16_t s = (uint16_t)in[i];
+    for (uint8_t b = 0; b < subframe - 2; b++) {
+      *out++ = 0;
+    }
+    *out++ = (uint8_t)(s & 0xFF);
+    *out++ = (uint8_t)(s >> 8);
+  }
+}
+
 /* Hand one block to the card.  Returns false if there is no card to take
  * it, in which case the caller paces itself instead. */
-static bool write_card(int16_t *buf, size_t frames) {
+static bool write_card(int16_t *buf, size_t frames, uint8_t *wide_buf) {
   bool written = false;
   xSemaphoreTake(s_dev_lock, portMAX_DELAY);
   if (s_dev) {
-    esp_err_t err = uac_host_device_write(s_dev, (uint8_t *)buf,
-                                          (uint32_t)(frames * BYTES_PER_FRAME),
-                                          pdMS_TO_TICKS(WRITE_TIMEOUT_MS));
+    uint8_t *data = (uint8_t *)buf;
+    size_t samples = frames * CHANNELS;
+    if (s_dev_subframe != sizeof(int16_t)) {
+      widen(buf, samples, s_dev_subframe, wide_buf);
+      data = wide_buf;
+    }
+    esp_err_t err =
+        uac_host_device_write(s_dev, data, (uint32_t)(samples * s_dev_subframe),
+                              pdMS_TO_TICKS(WRITE_TIMEOUT_MS));
     if (err == ESP_OK) {
       written = true;
     } else if (err == ESP_FAIL) {
@@ -346,11 +429,13 @@ static void playback_task(void *arg) {
   int16_t *pcm = malloc((size_t)(FRAME_SAMPLES + 1) * 2 * sizeof(int16_t));
   int16_t *silence = calloc((size_t)FRAME_SAMPLES * 2, sizeof(int16_t));
   int16_t *resample_buf = malloc(MAX_RESAMPLE_FRAMES * 2 * sizeof(int16_t));
-  if (!pcm || !silence || !resample_buf) {
+  uint8_t *wide_buf = malloc(MAX_RESAMPLE_FRAMES * CHANNELS * MAX_SUBFRAME);
+  if (!pcm || !silence || !resample_buf || !wide_buf) {
     ESP_LOGE(TAG, "Failed to allocate buffers");
     free(pcm);
     free(silence);
     free(resample_buf);
+    free(wide_buf);
     vTaskDelete(NULL);
     return;
   }
@@ -383,7 +468,7 @@ static void playback_task(void *arg) {
     }
     led_audio_feed(play_buf, play_samples);
 
-    if (write_card(play_buf, play_samples)) {
+    if (write_card(play_buf, play_samples, wide_buf)) {
       last_wake = xTaskGetTickCount();
       continue;
     }

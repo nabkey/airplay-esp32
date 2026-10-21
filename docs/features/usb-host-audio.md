@@ -29,8 +29,11 @@ speaker mode, which needs the same port.
 
 ## Supported cards
 
-- **16-bit stereo PCM** at 48 kHz, or 44.1 kHz as a fallback. A card that offers neither is
-  logged with its full list of formats and left unused.
+- **Stereo PCM at 16, 24 or 32 bits**, at 48 kHz or 44.1 kHz as a fallback. The narrowest
+  depth the card offers is used; wider ones carry the same 16-bit audio padded with zeros.
+  A card that offers none of these is logged with its full list of formats and left unused.
+- The card needs its own DAC chip. Passive USB-C to 3.5 mm adapters, which only pass analog
+  audio from a phone, do not work.
 - **ESP32-S2 and S3**: the OTG port is full-speed only, so only **UAC 1.0** cards work. Most
   inexpensive USB sound cards and dongles are UAC 1.0.
 - **ESP32-P4**: high-speed, so UAC 2.0 cards work as well.
