@@ -189,10 +189,11 @@ menu "Airplay ESP Configuration"
                 the opposite of "USB Audio Class (UAC)" above, where it
                 enumerates as a device on a computer.
 
-                The card must offer 16-bit stereo PCM at 48 kHz or
-                44.1 kHz. AirPlay audio is resampled to the card's rate
-                when needed. The S2 and S3 are full-speed only, so they
-                drive UAC 1.0 cards; UAC 2.0 cards need an ESP32-P4.
+                The card must be UAC 1.0 and offer 16, 24 or 32-bit
+                stereo PCM at 48 kHz or 44.1 kHz. AirPlay audio is
+                resampled to the card's rate when needed. UAC 2.0 cards
+                are not supported on any chip: the usb_host_uac driver
+                only accepts UAC 1.0.
 
                 The OTG port is claimed for the card, so USB-Serial-JTAG
                 console output is unavailable. Use the UART console and
