@@ -48,7 +48,7 @@ speaker mode, which needs the same port.
 - The card can be plugged in and out while the board runs. Playback continues in the
   background while no card is attached, so a card plugged in mid-song joins in sync.
 - AirPlay volume is applied in software, as on the S/PDIF output. The card's own volume is
-  left where it was.
+  set to 0 dB (or its maximum, if lower) and unmuted when streaming starts.
 - About 30 ms of audio is queued in the USB driver. Its depth is measured from transfer
   completions, the way the I2S output measures its DMA, so multiroom sync uses the real
   figure rather than an estimate. The card's own delay is added when it reports one

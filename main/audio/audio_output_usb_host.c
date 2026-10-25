@@ -393,6 +393,25 @@ static card_format_t s_card_fmt;
 /* Open the card's playback interface and start it at the best format for a
  * source at `want`, trying the next candidate rate if a start fails.  The
  * ring is sized at open, so a format that needs another size reopens. */
+/* Volume is applied in software, so the card's own gain only sets the
+ * ceiling.  Run it at unity (0 dB), or its maximum if that is below unity,
+ * and unmuted: cards power up at an arbitrary level, and the host they last
+ * met may have left them quiet or muted.  Cards without the controls keep
+ * their own. */
+static void card_gain_unity(uac_host_device_handle_t handle) {
+  esp_err_t err = uac_host_device_set_volume_db(handle, 0);
+  if (err == ESP_ERR_INVALID_ARG) {
+    err = uac_host_device_set_volume(handle, 100);
+  }
+  if (err != ESP_OK) {
+    ESP_LOGD(TAG, "Card volume not set: %s", esp_err_to_name(err));
+  }
+  err = uac_host_device_set_mute(handle, false);
+  if (err != ESP_OK) {
+    ESP_LOGD(TAG, "Card mute not set: %s", esp_err_to_name(err));
+  }
+}
+
 static bool start_card(uint32_t want, bool announce) {
   uint32_t ring_bytes = DRIVER_RING_BYTES(want, 2);
   uac_host_device_handle_t handle = NULL;
@@ -444,6 +463,7 @@ static bool start_card(uint32_t want, bool announce) {
                esp_err_to_name(err));
       continue;
     }
+    card_gain_unity(handle);
 
     /* The rate must be in place before the first completion counts
      * frames. */
