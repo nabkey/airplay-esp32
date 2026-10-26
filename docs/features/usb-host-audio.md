@@ -36,6 +36,10 @@ speaker mode, which needs the same port.
   restarts at the new one, which costs a moment of silence. A rate the card does not offer
   is resampled to 48 kHz, or 44.1 kHz if the card lacks 48 kHz too. A card that offers
   neither is logged with its full list of formats and left unused.
+- **Output packets up to 600 bytes.** The S3's USB FIFOs are small, so the build gives
+  isochronous OUT most of them (`CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT`). That covers
+  stereo up to 48 kHz at any depth, and 96 kHz at 16 bits. A card declaring more is refused
+  with `EP MPS (...) exceeds supported limit`.
 - The card needs its own DAC chip. Passive USB-C to 3.5 mm adapters, which only pass analog
   audio from a phone, do not work.
 - **UAC 1.0 only, on every chip.** Espressif's USB host audio driver rejects UAC 2.0
