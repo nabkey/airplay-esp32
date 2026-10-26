@@ -403,12 +403,17 @@ static card_format_t s_card_fmt;
 /* Volume is applied in software, so the card's own gain only sets the
  * ceiling.  Run it at unity (0 dB), or its maximum if that is below unity,
  * and unmuted: cards power up at an arbitrary level, and the host they last
- * met may have left them quiet or muted.  Cards without the controls keep
- * their own. */
+ * met may have left them quiet or muted.  The driver does not expose the
+ * range, so go to the maximum and read back what that is.  Cards without
+ * the controls keep their own. */
 static void card_gain_unity(uac_host_device_handle_t handle) {
-  esp_err_t err = uac_host_device_set_volume_db(handle, 0);
-  if (err == ESP_ERR_INVALID_ARG) {
-    err = uac_host_device_set_volume(handle, 100);
+  esp_err_t err = uac_host_device_set_volume(handle, 100);
+  int16_t max_db = 0; /* 1/256 dB */
+  if (err == ESP_OK) {
+    err = uac_host_device_get_volume_db(handle, &max_db);
+  }
+  if (err == ESP_OK && max_db > 0) {
+    err = uac_host_device_set_volume_db(handle, 0);
   }
   if (err != ESP_OK) {
     ESP_LOGD(TAG, "Card volume not set: %s", esp_err_to_name(err));
@@ -417,6 +422,25 @@ static void card_gain_unity(uac_host_device_handle_t handle) {
   if (err != ESP_OK) {
     ESP_LOGD(TAG, "Card mute not set: %s", esp_err_to_name(err));
   }
+}
+
+/* Append a USB string descriptor as ASCII, space-separated and trimmed.
+ * The ROM printf has no %ls. */
+static void append_usb_str(char *dst, size_t size, const wchar_t *src) {
+  size_t n = strlen(dst);
+  while (*src == L' ') {
+    src++;
+  }
+  if (*src && n && n + 1 < size) {
+    dst[n++] = ' ';
+  }
+  for (; *src && n + 1 < size; src++) {
+    dst[n++] = (*src >= 0x20 && *src < 0x7f) ? (char)*src : '?';
+  }
+  while (n && dst[n - 1] == ' ') {
+    n--;
+  }
+  dst[n] = '\0';
 }
 
 static bool start_card(uint32_t want, bool announce) {
@@ -436,8 +460,11 @@ static bool start_card(uint32_t want, bool announce) {
     return false;
   }
   if (announce) {
-    ESP_LOGI(TAG, "Sound card %04x:%04x \"%ls\" connected", info.VID, info.PID,
-             info.iProduct);
+    char name[2 * UAC_STR_DESC_MAX_LENGTH] = "";
+    append_usb_str(name, sizeof(name), info.iManufacturer);
+    append_usb_str(name, sizeof(name), info.iProduct);
+    ESP_LOGI(TAG, "Sound card %04x:%04x \"%s\" connected", info.VID, info.PID,
+             name);
   }
 
   uint32_t rates[3];
