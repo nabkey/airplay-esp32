@@ -89,10 +89,16 @@
 
 /* Driver-side ring.  The playback task keeps it full, so its size is the
  * steady-state output latency: ~20 ms is deep enough to ride out a source
- * burst and shallow enough not to matter to the timing engine. */
+ * burst and shallow enough not to matter to the timing engine.
+ *
+ * One byte over whole frames: everything in and out of the ring is whole
+ * frames, so it never fills to the last byte, and TX_DONE (sent while the
+ * ring is under the threshold of size - 1) fires on every completion.  A
+ * frame-exact ring loses the event whenever the blocked playback task
+ * refills it to full before the driver checks, about one in 20. */
 #define DRIVER_RING_MS 20
 #define DRIVER_RING_BYTES(rate, subframe) \
-  ((uint32_t)(rate) * DRIVER_RING_MS / 1000 * CHANNELS * (subframe))
+  ((uint32_t)(rate) * DRIVER_RING_MS / 1000 * CHANNELS * (subframe) + 1U)
 
 /* Longest a write may block before the task re-checks the card state. */
 #define WRITE_TIMEOUT_MS 50
@@ -307,7 +313,8 @@ static esp_err_t open_iface(uint8_t addr, uint8_t iface_num,
       .addr = addr,
       .iface_num = iface_num,
       .buffer_size = buffer_size,
-      /* One byte short of full: TX_DONE on every transfer completion. */
+      /* One byte short of full: TX_DONE on every transfer completion
+       * (see DRIVER_RING_BYTES). */
       .buffer_threshold = buffer_size - 1,
       .callback = uac_device_cb,
       .callback_arg = NULL,
