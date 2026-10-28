@@ -18,7 +18,7 @@ ROOT = HERE.parents[1]
 # Only ESP-IDF/platform dependencies are replaced. test.c includes
 # ptp_clock.c itself, so it can feed the filter samples directly.
 SHIMS = (
-    "esp_err.h", "esp_log.h", "esp_timer.h", "freertos/FreeRTOS.h",
+    "esp_err.h", "esp_log.h", "esp_mac.h", "esp_timer.h", "freertos/FreeRTOS.h",
     "freertos/task.h", "spiram_task.h",
 )
 

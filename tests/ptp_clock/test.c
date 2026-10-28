@@ -285,6 +285,61 @@ static void test_resume_breaks_outlier_run(void) {
   CHECK(ptp_clock_is_locked(), "resume or delayed sample dropped the lock");
 }
 
+/* A master that sends to each receiver directly drops one it does not hear
+ * from, so the receiver answers the master it follows, and only that one,
+ * with a DELAY_REQ every KEEPALIVE_INTERVAL_MS while it keeps sending. */
+static void test_keepalive(void) {
+  printf("DELAY_REQ keepalive\n");
+  reset();
+  ptp_clock_set_master_clock_id(MASTER_A);
+  struct sockaddr_in master = {.sin_family = AF_INET};
+  struct sockaddr_in other = {.sin_family = AF_INET};
+  master.sin_addr.s_addr = inet_addr("192.168.1.138");
+  other.sin_addr.s_addr = inet_addr("192.168.1.50");
+  uint8_t sync[PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE];
+
+  make_packet(sync, PTP_MSG_SYNC, MASTER_B, 1, 1, 0);
+  process_ptp_message(sync, sizeof(sync), true, &other);
+  CHECK(ptp.master_heard_ms == 0, "another master's SYNC was taken as ours");
+  uint16_t seq = ptp.keepalive_seq;
+  send_keepalive();
+  CHECK(ptp.keepalive_seq == seq, "keepalive sent before the master spoke");
+
+  make_packet(sync, PTP_MSG_SYNC, MASTER_A, 1, 2, 0);
+  process_ptp_message(sync, sizeof(sync), true, &master);
+  CHECK(ptp.master_addr == master.sin_addr.s_addr && ptp.master_heard_ms != 0,
+        "the master's address was not recorded");
+  make_packet(sync, PTP_MSG_SYNC, MASTER_B, 1, 3, 0);
+  process_ptp_message(sync, sizeof(sync), true, &other);
+  CHECK(ptp.master_addr == master.sin_addr.s_addr,
+        "another master's SYNC moved the address");
+
+  send_keepalive();
+  CHECK(ptp.keepalive_seq == (uint16_t)(seq + 1), "first keepalive not sent");
+  mock_now_ms += KEEPALIVE_INTERVAL_MS - 1;
+  process_ptp_message(sync, sizeof(sync), true, &master);
+  send_keepalive();
+  CHECK(ptp.keepalive_seq == (uint16_t)(seq + 1), "keepalive sent too soon");
+  mock_now_ms += 1;
+  send_keepalive();
+  CHECK(ptp.keepalive_seq == (uint16_t)(seq + 2), "keepalive not repeated");
+  mock_now_ms += LOCK_TIMEOUT_MS;
+  send_keepalive();
+  CHECK(ptp.keepalive_seq == (uint16_t)(seq + 2),
+        "keepalive sent to a master that went quiet");
+
+  const uint8_t identity[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  uint8_t req[PTP_DELAY_REQ_SIZE];
+  build_delay_req(req, identity, 0x1234);
+  const uint8_t expected[PTP_HEADER_SIZE] = {
+      0x01, 0x02, 0x00, 44,   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    0, 0,
+      0,    0,    0,    1,    2, 3, 4, 5, 6, 7, 8, 0, 1, 0x12, 0x34, 1, 0x7F,
+  };
+  CHECK(memcmp(req, expected, sizeof(expected)) == 0 &&
+            req[PTP_HEADER_SIZE] == 0 && req[PTP_DELAY_REQ_SIZE - 1] == 0,
+        "DELAY_REQ bytes are wrong");
+}
+
 /* The unfiltered listener can hear multiple masters before the first anchor.
  * A same-sequence FOLLOW_UP from another source must not fabricate a forward
  * clock step or let that step carry over when its master is selected. */
@@ -297,11 +352,11 @@ static void test_followup_source_identity(void) {
   uint8_t sync[PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE];
   uint8_t followup[sizeof(sync)];
   make_packet(sync, PTP_MSG_SYNC, MASTER_A, 1, 123, 0);
-  process_ptp_message(sync, sizeof(sync), true);
+  process_ptp_message(sync, sizeof(sync), true, NULL);
   mock_now_ms += 100;
   make_packet(followup, PTP_MSG_FOLLOW_UP, MASTER_B, 1, 123,
               (uint64_t)get_local_time_ns() + TRUE_OFFSET);
-  process_ptp_message(followup, sizeof(followup), false);
+  process_ptp_message(followup, sizeof(followup), false, NULL);
   CHECK(ptp.sample_count == samples && ptp.sample_clock_id == MASTER_B,
         "mismatched clock changed the accepted sample history");
   CHECK(ptp_clock_get_offset_ns() == before,
@@ -313,28 +368,28 @@ static void test_followup_source_identity(void) {
   /* A second port on the same clock is also a different source. Reject it,
    * and a wrong sequence, without consuming the pending valid SYNC. */
   make_packet(sync, PTP_MSG_SYNC, MASTER_B, 1, UINT16_MAX, 0);
-  process_ptp_message(sync, sizeof(sync), true);
+  process_ptp_message(sync, sizeof(sync), true, NULL);
   uint64_t origin = (uint64_t)get_local_time_ns() + TRUE_OFFSET;
   mock_now_ms += 100;
   make_packet(followup, PTP_MSG_FOLLOW_UP, MASTER_B, 2, UINT16_MAX,
               (uint64_t)get_local_time_ns() + TRUE_OFFSET);
-  process_ptp_message(followup, sizeof(followup), false);
+  process_ptp_message(followup, sizeof(followup), false, NULL);
   CHECK(ptp.sample_count == samples && ptp_clock_get_offset_ns() == before,
         "mismatched source port changed the offset");
   make_packet(followup, PTP_MSG_FOLLOW_UP, MASTER_B, 1, 0, origin);
-  process_ptp_message(followup, sizeof(followup), false);
+  process_ptp_message(followup, sizeof(followup), false, NULL);
   CHECK(ptp.sample_count == samples, "wrong sequence accepted");
   make_packet(followup, PTP_MSG_FOLLOW_UP, MASTER_B, 1, UINT16_MAX, origin);
-  process_ptp_message(followup, sizeof(followup), false);
+  process_ptp_message(followup, sizeof(followup), false, NULL);
   CHECK(ptp.sample_count == samples + 1, "matching FOLLOW_UP rejected");
 
   /* Sequence wrap is valid; a duplicate FOLLOW_UP is not another sample. */
   make_packet(sync, PTP_MSG_SYNC, MASTER_B, 1, 0, 0);
-  process_ptp_message(sync, sizeof(sync), true);
+  process_ptp_message(sync, sizeof(sync), true, NULL);
   make_packet(followup, PTP_MSG_FOLLOW_UP, MASTER_B, 1, 0,
               (uint64_t)get_local_time_ns() + TRUE_OFFSET);
-  process_ptp_message(followup, sizeof(followup), false);
-  process_ptp_message(followup, sizeof(followup), false);
+  process_ptp_message(followup, sizeof(followup), false, NULL);
+  process_ptp_message(followup, sizeof(followup), false, NULL);
   CHECK(ptp.sample_count == samples + 2,
         "sequence wrap rejected or duplicate FOLLOW_UP counted");
 }
@@ -348,20 +403,20 @@ static void test_followup_invalidation(void) {
   uint8_t sync[PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE];
   uint8_t followup[sizeof(sync)];
   make_packet(sync, PTP_MSG_SYNC, MASTER_A, 1, 10, 0);
-  process_ptp_message(sync, sizeof(sync), true);
+  process_ptp_message(sync, sizeof(sync), true, NULL);
   ptp_clock_clear();
   make_packet(followup, PTP_MSG_FOLLOW_UP, MASTER_A, 1, 10,
               (uint64_t)get_local_time_ns() + TRUE_OFFSET);
-  process_ptp_message(followup, sizeof(followup), false);
+  process_ptp_message(followup, sizeof(followup), false, NULL);
   CHECK(ptp.sample_count == 0, "clear retained a pending SYNC");
 
   ptp_clock_set_master_clock_id(MASTER_A);
   settle(MASTER_A, TRUE_OFFSET, 40);
-  process_ptp_message(sync, sizeof(sync), true);
+  process_ptp_message(sync, sizeof(sync), true, NULL);
   ptp_clock_set_master_clock_id(MASTER_B);
   make_packet(followup, PTP_MSG_FOLLOW_UP, MASTER_B, 1, 10,
               (uint64_t)get_local_time_ns() + TRUE_OFFSET);
-  process_ptp_message(followup, sizeof(followup), false);
+  process_ptp_message(followup, sizeof(followup), false, NULL);
   CHECK(ptp.sample_count == 0, "master change retained a pending SYNC");
 }
 
@@ -382,11 +437,11 @@ static void test_followup_does_not_refresh_old_sample(void) {
     uint8_t sync[PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE];
     uint8_t followup[sizeof(sync)];
     make_packet(sync, PTP_MSG_SYNC, MASTER_A, 1, 10, 0);
-    process_ptp_message(sync, sizeof(sync), true);
+    process_ptp_message(sync, sizeof(sync), true, NULL);
     uint64_t origin = (uint64_t)get_local_time_ns() + TRUE_OFFSET;
     mock_now_ms += delays[i];
     make_packet(followup, PTP_MSG_FOLLOW_UP, MASTER_A, 1, 10, origin);
-    process_ptp_message(followup, sizeof(followup), false);
+    process_ptp_message(followup, sizeof(followup), false, NULL);
     if (delays[i] > LOCK_TIMEOUT_MS) {
       CHECK(!ptp_clock_is_locked(), "late FOLLOW_UP revived an expired lock");
     }
@@ -405,7 +460,7 @@ static void foreign_packet_during_master_log(void) {
   make_packet(packet, PTP_MSG_SYNC, MASTER_A, 1, 50,
               (uint64_t)get_local_time_ns() + TRUE_OFFSET + 100 * MS);
   packet[6] = 0; // one-step sample
-  process_ptp_message(packet, sizeof(packet), true);
+  process_ptp_message(packet, sizeof(packet), true, NULL);
 }
 
 static void test_master_selection_log_yield(void) {
@@ -436,9 +491,9 @@ static void *packet_worker(void *unused) {
     if (i % 3 == 0) {
       sync[6] = 0;
     }
-    process_ptp_message(sync, sizeof(sync), true);
+    process_ptp_message(sync, sizeof(sync), true, NULL);
     make_packet(followup, PTP_MSG_FOLLOW_UP, master, 1, i, origin);
-    process_ptp_message(followup, sizeof(followup), false);
+    process_ptp_message(followup, sizeof(followup), false, NULL);
   }
   return NULL;
 }
@@ -532,7 +587,7 @@ static void test_session_handover(void) {
   for (int i = 0; i < 8; i++) {
     followup[20 + i] = (uint8_t)(MASTER_B >> (56 - 8 * i));
   }
-  process_ptp_message(followup, sizeof(followup), false);
+  process_ptp_message(followup, sizeof(followup), false, NULL);
   CHECK(ptp.rejected_master_count == rejected + 1,
         "other master's FOLLOW_UP let in between sessions");
   CHECK(ptp.sample_clock_id == MASTER_A,
@@ -552,6 +607,7 @@ int main(void) {
   test_forward_step_followed();
   test_resume_breaks_outlier_run();
   test_followup_source_identity();
+  test_keepalive();
   test_followup_invalidation();
   test_followup_does_not_refresh_old_sample();
   test_master_selection_log_yield();

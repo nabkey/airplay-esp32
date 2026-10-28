@@ -13,6 +13,16 @@ typedef int esp_err_t;
 #define ESP_FAIL              -1
 #define ESP_ERR_INVALID_STATE 0x103
 
+#define ESP_MAC_WIFI_STA 0
+static inline int esp_read_mac(uint8_t *mac, int type) {
+  (void)type;
+  static const uint8_t fixed[6] = {0xE0, 0x72, 0xA1, 0xDB, 0xCB, 0x00};
+  for (int i = 0; i < 6; i++) {
+    mac[i] = fixed[i];
+  }
+  return ESP_OK;
+}
+
 void mock_log(const char *tag, const char *format, ...);
 #define ESP_LOGE mock_log
 #define ESP_LOGW mock_log

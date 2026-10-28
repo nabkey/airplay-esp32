@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -35,6 +36,14 @@ static const char *TAG = "ptp_clock";
 #define PTP_HEADER_SIZE      34
 #define PTP_TIMESTAMP_OFFSET 34
 #define PTP_TIMESTAMP_SIZE   10
+#define PTP_DELAY_REQ_SIZE   (PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE)
+
+// Apple masters send SYNCs to the multicast group whether or not the receiver
+// says anything.  Others send to each receiver directly and drop one they have
+// not heard from in a while: OwnTone after 15 s, which loses the lock 5 s
+// later, mid-song.  A DELAY_REQ every couple of seconds keeps them sending;
+// the reply is not needed, so it is ignored like any other message.
+#define KEEPALIVE_INTERVAL_MS 2000
 
 // Synchronization parameters
 //
@@ -121,6 +130,9 @@ static struct {
   uint32_t previous_offset_time_ms; // 0 = no previous sample yet
   uint32_t mastership_start_ms;     // when continuous tracking began
   uint32_t last_sync_received_ms;
+  uint32_t master_addr;     // where the expected master's SYNCs come from
+  uint32_t master_heard_ms; // 0 = no SYNC from it yet
+  uint32_t last_keepalive_ms;
 
   // Statistics
   uint32_t sync_count;
@@ -133,6 +145,7 @@ static struct {
 
   // Two-step sync tracking
   uint16_t last_sync_seq;
+  uint16_t keepalive_seq;
   bool running;
 
   // Synchronization state
@@ -427,7 +440,8 @@ static void process_followup(const uint8_t *data, size_t len, uint16_t seq,
 
 // Process received PTP message
 static void process_ptp_message(const uint8_t *data, size_t len,
-                                bool is_event_port) {
+                                bool is_event_port,
+                                const struct sockaddr_in *from) {
   if (len < PTP_HEADER_SIZE) {
     return;
   }
@@ -454,6 +468,10 @@ static void process_ptp_message(const uint8_t *data, size_t len,
   case PTP_MSG_SYNC:
     if (is_event_port) {
       process_sync(data, len, seq, &log);
+      if (ptp.expected_clock_id != 0 && from) {
+        ptp.master_addr = from->sin_addr.s_addr;
+        ptp.master_heard_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+      }
     }
     break;
 
@@ -473,6 +491,59 @@ static void process_ptp_message(const uint8_t *data, size_t len,
   }
   portEXIT_CRITICAL(&ptp_state_mux);
   log_offset_update(&log);
+}
+
+// A DELAY_REQ from this receiver: header plus an origin timestamp, left zero
+// since the reply is never used.
+static void build_delay_req(uint8_t out[PTP_DELAY_REQ_SIZE],
+                            const uint8_t clock_identity[8], uint16_t seq) {
+  memset(out, 0, PTP_DELAY_REQ_SIZE);
+  out[0] = PTP_MSG_DELAY_REQ;
+  out[1] = 2; // PTP version
+  out[2] = 0;
+  out[3] = PTP_DELAY_REQ_SIZE;
+  memcpy(out + 20, clock_identity, 8);
+  out[29] = 1; // port number
+  out[30] = (uint8_t)(seq >> 8);
+  out[31] = (uint8_t)seq;
+  out[32] = 1;    // control field: Delay_Req
+  out[33] = 0x7F; // log message interval: not meaningful here
+}
+
+// Send the master a DELAY_REQ if it is due and the master is still sending.
+static void send_keepalive(void) {
+  uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+  portENTER_CRITICAL(&ptp_state_mux);
+  bool due = ptp.master_heard_ms != 0 &&
+             (now_ms - ptp.master_heard_ms) < LOCK_TIMEOUT_MS &&
+             (now_ms - ptp.last_keepalive_ms) >= KEEPALIVE_INTERVAL_MS;
+  uint32_t addr = ptp.master_addr;
+  uint16_t seq = ptp.keepalive_seq;
+  if (due) {
+    ptp.last_keepalive_ms = now_ms;
+    ptp.keepalive_seq++;
+  }
+  portEXIT_CRITICAL(&ptp_state_mux);
+  if (!due || ptp.event_socket < 0) {
+    return;
+  }
+
+  // EUI-64 from the station MAC, as PTP clock identities usually are.
+  uint8_t mac[6] = {0};
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  const uint8_t identity[8] = {mac[0], mac[1], mac[2], 0xFF,
+                               0xFE,   mac[3], mac[4], mac[5]};
+  uint8_t msg[PTP_DELAY_REQ_SIZE];
+  build_delay_req(msg, identity, seq);
+
+  struct sockaddr_in to = {0};
+  to.sin_family = AF_INET;
+  to.sin_addr.s_addr = addr;
+  to.sin_port = htons(PTP_EVENT_PORT);
+  if (sendto(ptp.event_socket, msg, sizeof(msg), 0, (struct sockaddr *)&to,
+             sizeof(to)) < 0) {
+    ESP_LOGD(TAG, "DELAY_REQ to master failed: %d", errno);
+  }
 }
 
 // Create and bind multicast socket
@@ -563,9 +634,13 @@ static void ptp_task(void *pvParameters) {
     } else {
       // Check event port (SYNC messages)
       if (ptp.event_socket >= 0 && FD_ISSET(ptp.event_socket, &read_fds)) {
-        ssize_t len = recv(ptp.event_socket, buffer, sizeof(buffer), 0);
+        struct sockaddr_in from = {0};
+        socklen_t from_len = sizeof(from);
+        ssize_t len = recvfrom(ptp.event_socket, buffer, sizeof(buffer), 0,
+                               (struct sockaddr *)&from, &from_len);
         if (len > 0) {
-          process_ptp_message(buffer, (size_t)len, true);
+          process_ptp_message(buffer, (size_t)len, true,
+                              from_len == sizeof(from) ? &from : NULL);
         }
       }
 
@@ -573,10 +648,11 @@ static void ptp_task(void *pvParameters) {
       if (ptp.general_socket >= 0 && FD_ISSET(ptp.general_socket, &read_fds)) {
         ssize_t len = recv(ptp.general_socket, buffer, sizeof(buffer), 0);
         if (len > 0) {
-          process_ptp_message(buffer, (size_t)len, false);
+          process_ptp_message(buffer, (size_t)len, false, NULL);
         }
       }
     }
+    send_keepalive();
   }
 
   // Cleanup
@@ -677,6 +753,7 @@ static void clear_clock_state(void) {
   ptp.last_sync_local_ns = 0;
   ptp.last_sync_received_ms = 0;
   ptp.awaiting_followup = false;
+  ptp.master_heard_ms = 0;
 
   ptp.sync_count = 0;
   ptp.followup_count = 0;
@@ -802,6 +879,7 @@ void ptp_clock_set_master_clock_id(uint64_t clock_id) {
     ptp.awaiting_followup = false;
     ptp.sample_clock_id = 0;
     ptp.consecutive_outliers = 0;
+    ptp.master_heard_ms = 0; // another master, maybe elsewhere
   }
   portEXIT_CRITICAL(&ptp_state_mux);
 
