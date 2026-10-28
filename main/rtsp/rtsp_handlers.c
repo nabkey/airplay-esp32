@@ -1269,9 +1269,19 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     ESP_LOGI(TAG, "SETUP: Initial connection setup (no streams)");
 
     if (is_bplist) {
-      uint8_t plist_body[128];
-      size_t plist_len = bplist_build_initial_setup(
-          plist_body, sizeof(plist_body), conn->event_port);
+      // Name the address the sender reached us on, as the Apple-Challenge
+      // reply does, for senders that send PTP to each receiver directly.
+      struct sockaddr_in local = {0};
+      socklen_t local_len = sizeof(local);
+      char timing_address[INET_ADDRSTRLEN] = "";
+      if (getsockname(socket, (struct sockaddr *)&local, &local_len) == 0 &&
+          local.sin_addr.s_addr != 0) {
+        inet_ntoa_r(local.sin_addr, timing_address, sizeof(timing_address));
+      }
+      uint8_t plist_body[192];
+      size_t plist_len =
+          bplist_build_initial_setup(plist_body, sizeof(plist_body),
+                                     conn->event_port, timing_address);
       if (plist_len == 0) {
         rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
                            NULL, 0);

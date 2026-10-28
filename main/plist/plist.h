@@ -248,14 +248,16 @@ bool bplist_find_string(const uint8_t *plist, size_t plist_len, const char *key,
 
 /**
  * Build initial SETUP response bplist (no streams array)
- * Returns eventPort and timingPort.
+ * Returns eventPort, timingPort and, given an address, timingPeerInfo.
  * @param out Output buffer
  * @param capacity Buffer capacity
  * @param event_port Event port to include in response
+ * @param timing_address Address the sender should send PTP to, or NULL
  * @return Length of generated bplist, or 0 on error
  */
 size_t bplist_build_initial_setup(uint8_t *out, size_t capacity,
-                                  uint16_t event_port);
+                                  uint16_t event_port,
+                                  const char *timing_address);
 
 /**
  * Build stream SETUP response bplist (with streams array)

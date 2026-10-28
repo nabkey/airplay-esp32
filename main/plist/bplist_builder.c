@@ -248,72 +248,91 @@ static bool bplist_finish(uint8_t *out, size_t capacity, size_t *pos,
 }
 
 size_t bplist_build_initial_setup(uint8_t *out, size_t capacity,
-                                  uint16_t event_port) {
-  if (capacity < 100) {
+                                  uint16_t event_port,
+                                  const char *timing_address) {
+  if (!out) {
     return 0;
   }
 
   size_t pos = 0;
+  size_t offsets[11];
+  size_t obj = 0;
+  uint8_t keys[3];
+  uint8_t values[3];
+  size_t count = 0;
+
+  if (!bplist_has_room(pos, 8, capacity)) {
+    return 0;
+  }
   memcpy(out + pos, BPLIST_MAGIC, sizeof(BPLIST_MAGIC));
   pos += 8;
 
-  size_t offsets[10];
-  size_t obj = 0;
+  offsets[obj] = pos; // 0: "eventPort"
+  keys[count] = (uint8_t)obj++;
+  if (!bplist_write_ascii_string(out, capacity, &pos, "eventPort")) {
+    return 0;
+  }
+  offsets[obj] = pos; // 1: event port
+  values[count++] = (uint8_t)obj++;
+  if (!bplist_write_int(out, capacity, &pos, event_port)) {
+    return 0;
+  }
+  offsets[obj] = pos; // 2: "timingPort"
+  keys[count] = (uint8_t)obj++;
+  if (!bplist_write_ascii_string(out, capacity, &pos, "timingPort")) {
+    return 0;
+  }
+  offsets[obj] = pos; // 3: 0, as timing is PTP
+  values[count++] = (uint8_t)obj++;
+  if (!bplist_write_int(out, capacity, &pos, 0)) {
+    return 0;
+  }
 
-  offsets[obj++] = pos;
-  out[pos++] = 0x59;
-  memcpy(out + pos, "eventPort", 9);
-  pos += 9;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x5A;
-  memcpy(out + pos, "timingPort", 10);
-  pos += 10;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x11;
-  out[pos++] = (event_port >> 8) & 0xFF;
-  out[pos++] = event_port & 0xFF;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x10;
-  out[pos++] = 0;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0xD2;
-  out[pos++] = 0;
-  out[pos++] = 1;
-  out[pos++] = 2;
-  out[pos++] = 3;
-
-  size_t offset_table_offset = pos;
-  for (size_t i = 0; i < obj; i++) {
-    if (offsets[i] > 0xFF) {
+  // Where to send PTP.  Apple senders find the receiver on the multicast
+  // group without it, but others (OwnTone, for one) message each receiver
+  // directly and give up on a SETUP reply that does not name one.
+  if (timing_address && timing_address[0]) {
+    offsets[obj] = pos; // 4: "timingPeerInfo"
+    keys[count] = (uint8_t)obj++;
+    if (!bplist_write_ascii_string(out, capacity, &pos, "timingPeerInfo")) {
       return 0;
     }
-    out[pos++] = (uint8_t)offsets[i];
+    offsets[obj] = pos; // 5: "Addresses"
+    if (!bplist_write_ascii_string(out, capacity, &pos, "Addresses")) {
+      return 0;
+    }
+    obj++;
+    offsets[obj] = pos; // 6: address
+    if (!bplist_write_ascii_string(out, capacity, &pos, timing_address)) {
+      return 0;
+    }
+    obj++;
+    const uint8_t address_refs[1] = {6};
+    offsets[obj] = pos; // 7: [address]
+    if (!bplist_write_array(out, capacity, &pos, address_refs, 1)) {
+      return 0;
+    }
+    obj++;
+    offsets[obj] = pos; // 8: "ID"
+    if (!bplist_write_ascii_string(out, capacity, &pos, "ID")) {
+      return 0;
+    }
+    obj++;
+    const uint8_t peer_keys[2] = {5, 8};
+    const uint8_t peer_values[2] = {7, 6};
+    offsets[obj] = pos; // 9: timing peer dict
+    values[count++] = (uint8_t)obj++;
+    if (!bplist_write_dict(out, capacity, &pos, peer_keys, peer_values, 2)) {
+      return 0;
+    }
   }
 
-  memset(out + pos, 0, 6);
-  pos += 6;
-  out[pos++] = 1;
-  out[pos++] = 1;
-
-  for (int i = 0; i < 7; i++) {
-    out[pos++] = 0;
+  const size_t top = obj;
+  offsets[obj++] = pos; // last: top-level dict
+  if (!bplist_write_dict(out, capacity, &pos, keys, values, count) ||
+      !bplist_finish(out, capacity, &pos, offsets, obj, top)) {
+    return 0;
   }
-  out[pos++] = (uint8_t)obj;
-
-  for (int i = 0; i < 7; i++) {
-    out[pos++] = 0;
-  }
-  out[pos++] = 4;
-
-  for (int i = 0; i < 7; i++) {
-    out[pos++] = 0;
-  }
-  out[pos++] = (uint8_t)offset_table_offset;
-
   return pos;
 }
 

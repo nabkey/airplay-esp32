@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 airplay-esp32 contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-/* Build the real /info response with an exactly allocated UTF-8 input. The
+/* Build the real /info response with an exactly allocated UTF-8 input, or
+ * with "setup" first, the initial SETUP response for a timing address. The
  * Python runner decodes it independently with plistlib. Sanitizers also check
  * every smaller output capacity and truncated UTF-8 input for overreads. */
 #include "plist.h"
@@ -27,7 +28,17 @@ static size_t build_info(uint8_t *out, size_t capacity, const char *name) {
                                     key, sizeof(key), 0x1e5a7ffff7ULL, 1);
 }
 
+static size_t build_setup(uint8_t *out, size_t capacity, const char *address) {
+  return bplist_build_initial_setup(out, capacity, 63061, address);
+}
+
 int main(int argc, char **argv) {
+  size_t (*build)(uint8_t *, size_t, const char *) = build_info;
+  if (argc == 3 && strcmp(argv[1], "setup") == 0) {
+    build = build_setup;
+    argv++;
+    argc--;
+  }
   if (argc != 2 || strlen(argv[1]) % 2 != 0) {
     return 1;
   }
@@ -44,7 +55,7 @@ int main(int argc, char **argv) {
                      hex_digit(argv[1][i * 2 + 1]));
   }
   name[name_bytes] = '\0';
-  size_t length = build_info(reference, 4096, name);
+  size_t length = build(reference, 4096, name);
   if (length == 0) {
     free(name);
     free(reference);
@@ -58,7 +69,7 @@ int main(int argc, char **argv) {
       free(reference);
       return 1;
     }
-    size_t actual = build_info(out, capacity, name);
+    size_t actual = build(out, capacity, name);
     bool valid = capacity < length
                      ? actual == 0
                      : actual == length && memcmp(out, reference, length) == 0;

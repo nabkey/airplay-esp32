@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check real AirPlay /info plists with an independent Unicode decoder.
+"""Check real AirPlay /info and SETUP plists with an independent decoder.
 
 Requires Python 3 and a C compiler; no ESP-IDF installation or hardware needed.
 Run from any directory with: python3 tests/bplist/run.py
@@ -27,6 +27,9 @@ INVALID_NAMES = (
     "f0", "f090", "f09080", "f08080af", "f1908041", "f4908080",
     "f5808080", "f888808080", "fe", "ff",
 )
+
+# No address leaves timingPeerInfo out, as before it was added.
+SETUP_ADDRESSES = ("", "192.168.1.219", "255.255.255.255")
 
 with tempfile.TemporaryDirectory(prefix="bplist-tests-") as temporary:
     build = Path(temporary)
@@ -63,7 +66,18 @@ with tempfile.TemporaryDirectory(prefix="bplist-tests-") as temporary:
         assert result.returncode == 2 and not result.stdout, (
             encoded, result.returncode, result.stderr.decode(errors="replace")
         )
+    for address in SETUP_ADDRESSES:
+        result = subprocess.run(
+            [str(build / "test"), "setup", address.encode("ascii").hex()],
+            check=True, stdout=subprocess.PIPE,
+        )
+        decoded = plistlib.loads(result.stdout)
+        expected = {"eventPort": 63061, "timingPort": 0}
+        if address:
+            expected["timingPeerInfo"] = {"Addresses": [address], "ID": address}
+        assert decoded == expected, (address, decoded)
     print(
         f"PASS: {len(VALID_NAMES)} Unicode round-trips with every output capacity; "
-        f"{len(INVALID_NAMES)} malformed UTF-8 sequences rejected"
+        f"{len(INVALID_NAMES)} malformed UTF-8 sequences rejected; "
+        f"{len(SETUP_ADDRESSES)} SETUP replies"
     )
