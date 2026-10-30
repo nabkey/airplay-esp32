@@ -127,6 +127,9 @@ jobs:
           - name: usb
             target: esp32s3
             sdkconfig: "config/sdkconfig.defaults;config/sdkconfig.defaults.esp32s3;config/sdkconfig.defaults.usb"
+          - name: usbhost
+            target: esp32s3
+            sdkconfig: "config/sdkconfig.defaults;config/sdkconfig.defaults.esp32s3;config/sdkconfig.defaults.usbhost"
           # Not an output backend, but no release board turns it on either.
           - name: software-eq
             target: esp32s3
