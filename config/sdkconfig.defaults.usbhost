@@ -1,0 +1,12 @@
+# USB host output: AirPlay audio plays through a USB sound card or DAC
+# plugged into the board's OTG port. Needs a chip with USB-OTG
+# (ESP32-S2/S3/P4). Layer on top of a board's defaults, e.g.
+#   idf.py -DSDKCONFIG_DEFAULTS="config/sdkconfig.defaults;config/sdkconfig.defaults.esp32s3;config/sdkconfig.defaults.usbhost" build
+
+CONFIG_AUDIO_OUTPUT_USB_HOST=y
+
+# Isochronous OUT packets go through the periodic TX FIFO, which the
+# default "Balanced" split caps at 128 bytes on the S3: too small for most
+# cards (a 48 kHz stereo card typically declares 192-384). This allows up
+# to 600, at the cost of IN packets, which only the control endpoint uses.
+CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT=y
